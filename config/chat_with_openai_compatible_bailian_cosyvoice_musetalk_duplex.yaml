@@ -29,92 +29,102 @@ default:
       InterruptHandler:
         module: logic/interrupt/interrupt_handler
 
-      # === 双工 VAD - 始终处理音频，不受 CLIENT_PLAYBACK 流生命周期控制 ===
+      # === 唤醒词：只负责开场。听到关键词后打开对话；长时间无人说话再关掉。打断由 Duplug 负责。===
+      WakeWord:
+        enabled: True
+        module: vad/wakeword/wakeword_handler
+        keywords:
+          - "你好小语"
+          - "小语"
+        asr_url: "ws://speech.xiaoyuzhineng.com:12392/"
+        api_key: "223707f61bf7752c880e"
+        asr_timeout_seconds: 8.0
+        speaking_threshold: 0.25
+        start_delay: 512  # 32ms：更快进入听写
+        end_delay: 4000  # 250ms：尾静音兜底（流式命中可提前到 early_wake_silence）
+        early_wake_silence: 1600  # 100ms：纯唤醒词 ASR 已出字即可提前唤醒
+        min_speech_samples: 3200
+        min_query_chars: 2
+        listen_timeout_seconds: 15.0
+        cooldown_seconds: 0.3
+        ack_text: "我在。"
+        ack_display_prefix: "【已唤醒】"
+        ack_timeout_seconds: 5.0
+
+      # === 双工 VAD：350ms 触发 Duplug 判停，900ms 兜底强制结束 ===
       SileroVad:
         module: vad/silerovad/duplex_vad_handler
         speaking_threshold: 0.25
         start_delay: 1024
-        end_delay: 32000
-        early_end_delay: 5000
-        early_end_repeat_delay: 1000
+        end_delay: 14400  # 900ms 兜底：静音到此仍未判停则强制回答
+        early_end_delay: 5600  # 350ms：静音达到后，若 Duplug 判定说完则开始回答
+        early_end_repeat_delay: 5600
         buffer_look_back: 2048
         speech_padding: 512
-        volume_threshold: -50
-        post_end_monitor_samples: 32000
-        reconnect_threshold_samples: 32000
+        volume_threshold: -45
+        post_end_monitor_samples: 28800  # 1.8s @16kHz，与 SoulXDuplug.post_end_wait_seconds 对齐
+        reconnect_threshold_samples: 28800  # 1.8s：判停后此时间内续说视为同一句
         post_end_energy_threshold: -5
 
-      # === ASR - 使用类型覆盖接收双工音频 ===
-      SenseVoice:
-        enabled: True
-        module: asr/sensevoice/asr_handler_sensevoice
-        model_name: "iic/SenseVoiceSmall"
-        input_type_override:
-          HUMAN_AUDIO: HUMAN_DUPLEX_AUDIO
-        output_type_override:
-          HUMAN_TEXT: HUMAN_DUPLEX_TEXT
-
-      # === Smart Turn EOU - 基于 ONNX 模型的端点检测 ===
-      SmartTurnEOU:
-        enabled: true
-        module: vad/smart_turn_eou/eou_handler_smart_turn
-        threshold: 0.8
-        max_buffer_seconds: 300.0
+      # === ASR：对话文本由 Duplug 在判停时提交，避免第二路识别污染 LLM ===
+      XiaoyuASR:
+        enabled: False
+        module: asr/xiaoyu/asr_handler_xiaoyu
+        asr_url: "ws://speech.xiaoyuzhineng.com:12392/"
+        api_key: "223707f61bf7752c880e"
+        timeout_seconds: 15.0
         sample_rate: 16000
-        model_path: "models/smart_turn/smart-turn-v3.1-cpu.onnx"
         input_type_override:
           HUMAN_AUDIO: HUMAN_DUPLEX_AUDIO
 
-      # === 语义轮次检测器 - 负责打断检测和话语完成检测 ===
-      SemanticTurnDetector:
-        enabled: true
-        module: llm/semantic_turn_detector/semantic_turn_detector_handler
-        duplex_mode: true
-        # 语义打断判断主 LLM
-        api_url: "https://dashscope.aliyuncs.com/compatible-mode/v1"
-        # api_key: ""  # default=os.getenv("SEMANTIC_LLM_EAS_TOKEN") or DASHSCOPE_API_KEY
-        model_name: "qwen-plus"
-        # 打断检测配置
-        enable_interrupt_detection: true
-        interrupt_on_any_speech: false
-        min_text_length_for_interrupt: 2
-        # 话语完成检测
-        enable_completion_detection: false
-        min_text_length_for_completion: 1
-        # 打断意图判断 LLM
-        interrupt_judge_api_url: "https://dashscope.aliyuncs.com/compatible-mode/v1"
-        # interrupt_judge_api_key: ""  # default=os.getenv("INTERRUPT_JUDGE_LLM_EAS_TOKEN") or DASHSCOPE_API_KEY
-        interrupt_judge_model_name: "qwen-plus"
-        request_timeout: 3.0
-        max_context_turns: 3
+      # === SoulX-Duplug：全双工语义 VAD（打断 + 判停）===
+      # 需先启动 Duplug 推理服务：cd /root/SoulX-Duplug && bash run.sh
+      SoulXDuplug:
+        enabled: True
+        module: vad/duplug/duplug_handler
+        server_url: "ws://127.0.0.1:8000/turn"
+        chunk_samples: 2560
+        sample_rate: 16000
+        request_timeout: 5.0
+        interrupt_on_nonidle: true
+        min_interrupt_chars: 2
+        interrupt_cooldown_seconds: 0.4
+        interrupt_grace_seconds: 0.3
+        asr_url: "ws://speech.xiaoyuzhineng.com:12392/"
+        api_key: "223707f61bf7752c880e"
+        asr_timeout_seconds: 8.0
+        post_end_wait_seconds: 1.8  # 与 SileroVad.post_end_monitor_samples=28800 对齐
 
       # === TTS ===
-      CosyVoice:
+      CustomTTS:
         enabled: True
-        module: tts/bailian_tts/tts_handler_cosyvoice_bailian
-        voice: "longxiaochun"
-        model_name: "cosyvoice-v1"
-        # api_key: "" # default=os.getenv("DASHSCOPE_API_KEY")
+        module: tts/custom_tts/tts_handler_custom
+        tts_url: "http://14.204.16.34:6021/vox_tts"
+        api_key: "maiyuekeji"
+        voice_type: "zh_male"
+        lang: "zh"
+        sample_rate: 16000
+        stream: true
+        min_flush_chars: 4
 
       # === LLM ===
       LLMOpenAICompatible:
         enabled: True
         module: llm/openai_compatible/llm_handler_openai_compatible
-        model_name: "qwen-plus"
+        model_name: "hermes"
         enable_video_input: False
         history_length: 20
-        system_prompt: "请你扮演一个 AI 助手，用简短的两三句对话来回答用户的问题，并在对话内容中加入合适的标点符号，不需要讨论标点符号相关的内容"
-        api_url: "https://dashscope.aliyuncs.com/compatible-mode/v1"
-        # api_key: "" # default=os.getenv("DASHSCOPE_API_KEY")
+        system_prompt: "你是一个语音助手，用一两句简洁的话回答用户的问题。"
+        api_url: "http://127.0.0.1:8080/v1"
+        session_id: "open_avatar_chat_session"
+        warmup: true
 
       # === MuseTalk 数字人 Avatar ===
       AvatarMusetalk:
         module: avatar/musetalk/avatar_handler_musetalk
-        # Allowed fps: 15, 16, 20, 24, 25, 30, 32, 40, 48 (must divide 24000 and be <=49); other values get auto-corrected to a nearby divisor and break server load.
         fps: 24
         batch_size: 2
-        # avatar_video_path: "src/handlers/avatar/musetalk/MuseTalk/data/video/yongen.mp4" 
-        avatar_video_path: "resource/avatar/liteavatar/20250408/sample_data/bg_video_silence.mp4"
+        avatar_video_path: "resource/custom5.mp4"
         avatar_model_dir: "models/musetalk/avatar_model"
         force_create_avatar: false
         debug: false
