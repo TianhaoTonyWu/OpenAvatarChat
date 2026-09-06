@@ -31,3 +31,4 @@ class ChatDataType(Enum):
     # Agent system data types
     PERCEPTION_CONTEXT = ("perception_context", EngineChannelType.DATA)
     ENVIRONMENT_EVENT = ("environment_event", EngineChannelType.EVENT)
+    SYSTEM_NOTIFY = ("system_notify", EngineChannelType.TEXT)

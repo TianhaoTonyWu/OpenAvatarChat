@@ -85,6 +85,8 @@ def main():
                                                       engine_config.model_root.replace('models', ''))
 
     config_loggers(logger_config)
+    from engine_utils.latency_tracer import latency
+    latency.setup()
     
     demo_app, ui, parent_block = setup_demo()
     

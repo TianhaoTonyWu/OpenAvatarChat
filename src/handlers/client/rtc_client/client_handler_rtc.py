@@ -239,6 +239,9 @@ from handlers.client.ws_client.ws_message_protocol import (
     EchoAvatarText,
     EchoHumanText,
     EchoTextPayload,
+    Error,
+    ErrorCode,
+    ErrorPayload,
     MessageHeader,
     MessageType,
     serialize_message,
@@ -478,6 +481,9 @@ class ClientHandlerRtc(ClientHandlerBase):
             ChatDataType.HUMAN_TEXT: HandlerDataInfo(
                 type=ChatDataType.HUMAN_TEXT
             ),
+            ChatDataType.SYSTEM_NOTIFY: HandlerDataInfo(
+                type=ChatDataType.SYSTEM_NOTIFY
+            ),
         }
         _no_link = ChatStreamConfig(cancelable=False, auto_link_input=False)
         outputs = {
@@ -558,6 +564,16 @@ class ClientHandlerRtc(ClientHandlerBase):
                     metadata=stream_metadata,
                 ),
             )
+        elif inputs.type == ChatDataType.SYSTEM_NOTIFY:
+            notify_text = (text or "").strip()
+            if not notify_text:
+                return False
+            response = Error(
+                header=MessageHeader(name=MessageType.ERROR, request_id=str(uuid4())),
+                payload=ErrorPayload(code=ErrorCode.LLM_ERROR, message=notify_text),
+            )
+        else:
+            return False
         return self._send_message_to_chat_channel(context.session_id, response)
 
     def handle(self, context: HandlerContext, inputs: ChatData,

@@ -36,6 +36,13 @@ class SileroVADConfigModel(HandlerBaseConfigModel, BaseModel):
     # 重连机制配置
     post_end_monitor_samples: int = Field(default=16000, description="判停后监控期长度（样本数），16000 = 1秒")
     reconnect_threshold_samples: int = Field(default=8000, description="重连阈值（样本数），小于此值认为是误判")
+    # One energy/VAD clip (512 samples @16kHz) is enough to treat POST_END
+    # speech as a continuation. Using start_delay (often 1024) dropped a
+    # trailing syllable that only accumulated 512 samples.
+    post_end_speech_trigger_samples: int = Field(
+        default=512,
+        description="POST_END 期间累计多少语音样本后触发重连",
+    )
     # POST_END 能量检测阈值（dB），作为 VAD 模型的备份检测
     # 当音频能量超过此阈值时，即使 VAD 模型没检测到语音，也认为有语音活动
     post_end_energy_threshold: float = Field(default=-35, description="POST_END 期间能量检测阈值（dB），高于此值认为有语音")
@@ -147,13 +154,14 @@ class HumanAudioVADContext(HandlerContext):
                     head_sample_id = history_timestamp
                 audio_clips.append(history_clip)
             output_audio = np.concatenate(audio_clips, axis=0)
-            output_audio = np.concatenate(
-                [np.zeros(self.config.speech_padding, dtype=clip.dtype), output_audio], axis=0)
+            # Do not prepend zeros. Leading silence makes Xiaoyu emit a
+            # sentence-initial "，" and can hide the first syllable ("实验室"→"验室").
+            # Look-back already contains real pre-onset audio.
             self.speech_id += 1
             logger.info("Start of human speech")
             extra_args =  {
                 "human_speech_start": True,
-                "pre_padding": self.config.speech_padding,
+                "pre_padding": 0,
                 "speech_length_at_start": self.speech_length,
             }
             if head_sample_id is not None:
@@ -169,9 +177,12 @@ class HumanAudioVADContext(HandlerContext):
             return None, extra_args
 
     def _update_status_on_start(self, clip: np.ndarray, timestamp: Optional[int] = None):
-        # 检查是否满足结束条件：正常 end_delay 或收到候选结束信号
-        should_end = (self.silence_length >= self.config.end_delay or 
-                      self.candidate_end_received)
+        # End on trailing silence only. Duplug "speak" after a short phrase
+        # (e.g. 「介绍一下」) used to cut the rest of the name.
+        should_end = (
+            self.silence_length >= self.config.end_delay
+            or self.candidate_end_received
+        )
         
         if should_end:
             # 进入 POST_END 状态，同时结束当前 stream（让 ASR 及时处理）
@@ -183,15 +194,23 @@ class HumanAudioVADContext(HandlerContext):
             self.post_end_speech_audio.clear()  # 清空 POST_END 期间的语音缓冲
             output_audio = np.concatenate(
                 [clip, np.zeros(self.config.speech_padding, dtype=clip.dtype)], axis=0)
-            if self.candidate_end_received:
-                logger.info("End of human speech (confirmed by EOU), entering POST_END monitoring")
+            eou_confirmed = self.candidate_end_received
+            if eou_confirmed:
+                reason = "eou_candidate"
+                logger.info(
+                    f"End of human speech (confirmed by {reason}, "
+                    f"silence={self.silence_length} samples), entering POST_END monitoring"
+                )
             else:
-                logger.info("End of human speech, entering POST_END monitoring")
+                logger.info(
+                    f"End of human speech (fallback silence={self.silence_length} samples), "
+                    "entering POST_END monitoring"
+                )
             extra_args = {
                 "human_speech_end": True,
                 "post_padding": self.config.speech_padding,
                 "silence_length_at_end": self.silence_length,
-                "eou_confirmed": self.candidate_end_received,
+                "eou_confirmed": eou_confirmed,
                 "entering_post_end": True,
             }
             if timestamp is not None:
@@ -257,7 +276,11 @@ class HumanAudioVADContext(HandlerContext):
             logger.info(f"POST_END: speech detected by {detection_source}, accumulated {self.post_end_speech_counter} samples")
         
         # 使用累积计数器检测新语音（而不是 speech_length）
-        if self.post_end_speech_counter >= self.config.start_delay:
+        speech_trigger = max(
+            self.clip_size,
+            int(self.config.post_end_speech_trigger_samples or self.clip_size),
+        )
+        if self.post_end_speech_counter >= speech_trigger:
             # 计算时间间隔
             time_gap = timestamp - self.last_stream_end_time if (timestamp is not None and self.last_stream_end_time is not None) else 0
             
@@ -287,7 +310,7 @@ class HumanAudioVADContext(HandlerContext):
         if self.post_end_counter >= self.config.post_end_monitor_samples:
             logger.info(f"POST_END monitoring period ended, confirming end was correct "
                        f"(accumulated speech: {self.post_end_speech_counter} samples, "
-                       f"threshold: {self.config.start_delay})")
+                       f"threshold: {speech_trigger})")
             self.speaking_status = SpeakingStatus.END
             self.reset_reconnect_state()
             return None, {"post_end_timeout": True}

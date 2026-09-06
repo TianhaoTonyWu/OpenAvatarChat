@@ -626,9 +626,11 @@ class ChatStreamer:
                 and now - stats.end_mark >= self._ended_input_retention):
                 to_remove.append(key)
                 continue
-            # Remove cancelled streams
+            # Drop cancelled or already-recycled parents. A missing parent used
+            # to stay in the map and auto-cancel the new downstream stream
+            # (HUMAN_TEXT never reached the LLM).
             stream = self._storage.find_stream(stats.stream_id)
-            if stream is not None and stream.status == ChatStreamStatus.CANCELLED:
+            if stream is None or stream.status == ChatStreamStatus.CANCELLED:
                 to_remove.append(key)
         for key in to_remove:
             self._input_stream_ids.pop(key, None)
@@ -792,6 +794,12 @@ class ChatStreamer:
             else:
                 source_streams = [value.stream_id for value in self._input_stream_ids.values()]
                 self.new_stream(source_streams)
+                if self.current_stream is None:
+                    logger.warning(
+                        f"Parent streams unavailable for {self._data_type}, "
+                        "creating an independent stream"
+                    )
+                    self.new_stream([])
         stream = self.current_stream
         if stream is None:
             raise ValueError("No current stream")

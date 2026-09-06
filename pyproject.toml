@@ -42,6 +42,7 @@ dependencies = [
     "onnxruntime-gpu~=1.20.2",
     "protobuf>=4.25.3,<5",  # TensorFlow 2.16.x 兼容范围，避免 MessageFactory.GetPrototype 报错
     "huggingface-hub>=0.23.2,<1.0",
+    "websocket-client>=1.8.0",
 ]
 
 [tool.uv.workspace]

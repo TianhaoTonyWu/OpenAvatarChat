@@ -16,6 +16,7 @@ from handlers.avatar.musetalk.musetalk_data_models import (
 )
 from handlers.avatar.musetalk.musetalk_algo import MuseTalkAlgoV15
 from handlers.avatar.musetalk.musetalk_config import AvatarMuseTalkConfig
+from engine_utils.latency_tracer import latency
 
 class AvatarMuseTalkProcessor:
     """MuseTalk processor responsible for audio-to-video conversion (multi-threaded queue structure)."""
@@ -73,6 +74,9 @@ class AvatarMuseTalkProcessor:
         self._collector_wall_clock: int = 0
         self._next_producer_idx: int = 0
         self._last_seen_speech_id: Optional[str] = None
+        self._latency_session_id: str = ""
+        self._starve_log_at: float = 0.0
+        self._prefetch_speech_id: Optional[str] = None
 
     def set_callbacks(self, callbacks: MuseTalkProcessorCallbacks):
         self._callbacks = callbacks
@@ -312,8 +316,14 @@ class AvatarMuseTalkProcessor:
                     ), timeout=1)
 
                 t_end = time.time()
+                feat_ms = (t_end - t_start) * 1000.0
                 if self._config.debug:
-                    logger.info(f"[FEATURE_WORKER] speech_id={speech_id}, total_time={(t_end-t_start)*1000:.1f}ms, num_chunks={num_chunks}, orig_audio_len={orig_audio_len}, end_of_speech={end_of_speech}")
+                    logger.info(f"[FEATURE_WORKER] speech_id={speech_id}, total_time={feat_ms:.1f}ms, num_chunks={num_chunks}, orig_audio_len={orig_audio_len}, end_of_speech={end_of_speech}")
+                latency.sample(
+                    "musetalk", "whisper_feature", feat_ms,
+                    session_id=getattr(self, "_latency_session_id", "") or "",
+                    speech_id=speech_id, chunks=num_chunks,
+                )
             except queue.Empty:
                 continue
             except Exception as e:
@@ -447,10 +457,17 @@ class AvatarMuseTalkProcessor:
                 logger.opt(exception=True).error(f"[GEN_FRAME_ERROR] frame_id={frame_ids[0]}, speech_id={batch_speech_id[0]}, error: {e}")
                 pred_latents = torch.zeros((batch_size, 4, 32, 32), dtype=self._avatar.unet.model.dtype, device=self._avatar.device)
                 idx_list = [frame_ids[0] + i for i in range(batch_size)]
-            if self._config.debug:
-                logger.info(f"[FRAME_GEN] UNet batch: speech_id={batch_speech_id[0]}, batch_size={batch_size}, time={(time.time() - batch_start_time)*1000:.1f}ms")
             if self._interrupted.is_set():
                 continue
+
+            unet_ms = (time.time() - batch_start_time) * 1000.0
+            if self._config.debug:
+                logger.info(f"[FRAME_GEN] UNet batch: speech_id={batch_speech_id[0]}, batch_size={batch_size}, time={unet_ms:.1f}ms")
+            latency.sample(
+                "musetalk", "unet_batch", unet_ms,
+                session_id=getattr(self, "_latency_session_id", "") or "",
+                speech_id=batch_speech_id[0], batch_size=batch_size,
+            )
 
             # --- Enqueue entire batch as a single UNetQueueItem for VAE worker ---
             self._unet_queue.put(UNetQueueItem(
@@ -496,8 +513,14 @@ class AvatarMuseTalkProcessor:
                     # Fallback: zero face crops
                     logger.opt(exception=True).error(f"[GEN_FRAME_ERROR] frame_id={item.idx_list[0]}, speech_id={item.speech_id[0] if isinstance(item.speech_id, list) else item.speech_id}, error: {e}")
                     recon_idx_list = [(np.zeros((256, 256, 3), dtype=np.uint8), item.idx_list[0] + i) for i in range(cur_batch)]
+                vae_ms = (time.time() - batch_start_time) * 1000.0
                 if self._config.debug:
-                    logger.info(f"[FRAME_GEN] VAE batch: batch_size={cur_batch}, time={(time.time() - batch_start_time)*1000:.1f}ms")
+                    logger.info(f"[FRAME_GEN] VAE batch: batch_size={cur_batch}, time={vae_ms:.1f}ms")
+                latency.sample(
+                    "musetalk", "vae_batch", vae_ms,
+                    session_id=getattr(self, "_latency_session_id", "") or "",
+                    batch_size=cur_batch,
+                )
                 if self._interrupted.is_set():
                     continue
 
@@ -545,8 +568,14 @@ class AvatarMuseTalkProcessor:
                 # Fallback: zero face crops
                 logger.opt(exception=True).error(f"[GEN_FRAME_ERROR] frame_id={frame_ids[0]}, speech_id={batch_speech_id[0]}, error: {e}")
                 recon_idx_list = [(np.zeros((256, 256, 3), dtype=np.uint8), frame_ids[0] + i) for i in range(batch_size)]
+            full_ms = (time.time() - batch_start_time) * 1000.0
             if self._config.debug:
-                logger.info(f"[FRAME_GEN] Full batch: speech_id={batch_speech_id[0]}, batch_size={batch_size}, time={(time.time() - batch_start_time)*1000:.1f}ms")
+                logger.info(f"[FRAME_GEN] Full batch: speech_id={batch_speech_id[0]}, batch_size={batch_size}, time={full_ms:.1f}ms")
+            latency.sample(
+                "musetalk", "full_batch", full_ms,
+                session_id=getattr(self, "_latency_session_id", "") or "",
+                speech_id=batch_speech_id[0], batch_size=batch_size,
+            )
             if self._interrupted.is_set():
                 continue
 
@@ -621,6 +650,36 @@ class AvatarMuseTalkProcessor:
             if output_item is not None and self._interrupted.is_set():
                 output_item = None                                 # Discard stale frame on interrupt
 
+            # Mid-utterance GPU starve: do NOT emit a silence chunk. Each idle
+            # insertion punches ~1/fps of zeros into AVATAR_AUDIO and makes TTS
+            # sound stuttered. Pause the metronome until the next real frame,
+            # then re-anchor so we don't burst-catch-up (which would speed up
+            # speech). Listening still fills with idle video + silence audio.
+            in_active_speech = last_speaking and not last_end_of_speech
+            if output_item is None and in_active_speech and not self._interrupted.is_set():
+                now_m = time.monotonic()
+                if now_m - self._starve_log_at > 2.0:
+                    logger.warning(
+                        f"[IDLE_FRAME] GPU starve during speaking, pausing metronome: "
+                        f"frame_id={local_frame_id} (not inserting silence)"
+                    )
+                    self._starve_log_at = now_m
+                while not self._stop_event.is_set() and not self._interrupted.is_set():
+                    try:
+                        output_item = self._output_queue.get(timeout=0.01)
+                    except queue.Empty:
+                        continue
+                    if output_item is not None and self._interrupted.is_set():
+                        output_item = None
+                        break
+                    if output_item is not None:
+                        break
+                # Re-anchor: next ticks stay at 1/fps from *now*, not wall-clock catch-up.
+                start_time = time.perf_counter() - local_frame_id * frame_interval
+                t_frame_start = time.perf_counter()
+                if output_item is None:
+                    continue
+
             # --- Decide output: speaking frame vs idle frame ---
             if output_item is not None:
                 frame = output_item.frame
@@ -629,14 +688,26 @@ class AvatarMuseTalkProcessor:
                 end_of_speech = output_item.end_of_speech
                 frame_timestamp = output_item.timestamp
                 audio_segment = output_item.audio_segment
+                # Prefetch a few frames at speech start so a short GPU hitch
+                # does not pause TTS audio.
+                if (
+                    avatar_status == MuseTalkAvatarStatus.SPEAKING
+                    and speech_id != self._prefetch_speech_id
+                    and not end_of_speech
+                ):
+                    self._prefetch_speech_id = speech_id
+                    deadline = time.perf_counter() + 0.12
+                    while (
+                        self._output_queue.qsize() < 4
+                        and time.perf_counter() < deadline
+                        and not self._stop_event.is_set()
+                        and not self._interrupted.is_set()
+                    ):
+                        time.sleep(0.005)
+                    start_time = time.perf_counter() - local_frame_id * frame_interval
+                    t_frame_start = time.perf_counter()
             else:
-                # SPEAKING starve: hold the last emitted frame to avoid a mouth
-                # twitch. Audio stays silence — repeating audio would delay
-                # the whole stream. LISTENING still uses the regular idle frame.
-                if last_speaking and not last_end_of_speech and self._last_emitted_frame is not None:
-                    frame = self._last_emitted_frame
-                else:
-                    frame = self._avatar.generate_idle_frame(local_frame_id)
+                frame = self._avatar.generate_idle_frame(local_frame_id)
                 speech_id = last_active_speech_id
                 avatar_status = MuseTalkAvatarStatus.LISTENING
                 end_of_speech = False
@@ -646,6 +717,17 @@ class AvatarMuseTalkProcessor:
             is_idle = (output_item is None)
             is_speaking = (avatar_status == MuseTalkAvatarStatus.SPEAKING)
             is_end_of_speech = bool(end_of_speech)
+
+            if is_speaking and speech_id != current_speech_id:
+                latency.mark(
+                    "musetalk", "first_speaking_frame",
+                    session_id=getattr(self, "_latency_session_id", "") or "",
+                    speech_id=speech_id, frame_id=local_frame_id,
+                )
+                latency.complete_turn(
+                    getattr(self, "_latency_session_id", "") or "",
+                    reason="avatar_first_frame",
+                )
 
             # --- Logging: speaking START/END transitions and idle insertion ---
             if self._config.debug:

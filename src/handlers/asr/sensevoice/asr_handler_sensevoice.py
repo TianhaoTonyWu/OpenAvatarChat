@@ -1,7 +1,7 @@
 
 
 import re
-from typing import Dict, Optional, cast
+from typing import Dict, List, Optional, cast
 from loguru import logger
 import numpy as np
 from pydantic import BaseModel, Field
@@ -15,14 +15,19 @@ from chat_engine.data_models.chat_data.chat_data_model import ChatData
 from chat_engine.data_models.chat_data_type import ChatDataType
 from chat_engine.data_models.runtime_data.data_bundle import DataBundle, DataBundleDefinition, DataBundleEntry
 from chat_engine.contexts.session_context import SessionContext
-from funasr import AutoModel
-
 from engine_utils.directory_info import DirectoryInfo
 from engine_utils.general_slicer import SliceContext, slice_data
+from handlers.asr.sensevoice.shared_model import (
+    DEFAULT_ASR_MODEL,
+    configure_hotwords,
+    get_sensevoice_model,
+    sensevoice_generate,
+)
 
 
 class ASRConfig(HandlerBaseConfigModel, BaseModel):
-    model_name: str = Field(default="iic/SenseVoiceSmall")
+    model_name: str = Field(default=DEFAULT_ASR_MODEL)
+    hotwords: List[str] = Field(default_factory=lambda: ["你好小语", "小语"])
 
 
 class ASRContext(HandlerContext):
@@ -49,7 +54,7 @@ class HandlerASR(HandlerBase, ABC):
     def __init__(self):
         super().__init__()
 
-        self.model_name = 'iic/SenseVoiceSmall'
+        self.model_name = DEFAULT_ASR_MODEL
 
         if torch.cuda.is_available():
             self.device = torch.device("cuda:0")
@@ -86,11 +91,9 @@ class HandlerASR(HandlerBase, ABC):
     def load(self, engine_config: ChatEngineConfigModel, handler_config: Optional[BaseModel] = None):
         if isinstance(handler_config, ASRConfig):
             self.model_name = handler_config.model_name
-            model_path = os.path.join(DirectoryInfo.get_models_dir(), handler_config.model_name)
-            if os.path.exists(model_path):
-                self.model_name = model_path
+            configure_hotwords(handler_config.hotwords)
         logger.info(f"load model {self.model_name}")
-        self.model = AutoModel(model=self.model_name, disable_update=True)
+        self.model = get_sensevoice_model(self.model_name)
 
     def create_context(self, session_context, handler_config=None):
         if not isinstance(handler_config, ASRConfig):
@@ -137,9 +140,12 @@ class HandlerASR(HandlerBase, ABC):
             logger.info('dump audio')
             context.audio_dump_file.write(output_audio.tobytes())
 
-        res = self.model.generate(input=output_audio, batch_size_s=10)
+        res = sensevoice_generate(output_audio, batch_size_s=10)
         logger.info(res)
         context.output_audios.clear()
+        if not res or not isinstance(res, list) or not res[0] or "text" not in res[0]:
+            logger.warning(f"ASR empty result: {res}")
+            return
         output_text = re.sub(r"<\|.*?\|>", "", res[0]['text'])
         if len(output_text) == 0:
             return

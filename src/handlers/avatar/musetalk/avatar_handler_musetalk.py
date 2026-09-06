@@ -29,6 +29,7 @@ from handlers.avatar.musetalk.musetalk_processor import AvatarMuseTalkProcessor
 from handlers.avatar.musetalk.musetalk_algo import MuseTalkAlgoV15
 from handlers.avatar.musetalk.musetalk_config import AvatarMuseTalkConfig
 from engine_utils.general_slicer import slice_data, SliceContext
+from engine_utils.latency_tracer import latency
 
 
 class MuseTalkProcessorPool:
@@ -315,6 +316,7 @@ class HandlerAvatarMuseTalk(HandlerBase):
     def start_context(self, session_context: SessionContext, handler_context: HandlerContext):
         context = cast(AvatarMuseTalkContext, handler_context)
         context.init_playback_streamer()
+        context.processor._latency_session_id = context.session_id
         context.processor.start()
         logger.info(f"Context started, processor running for session {context.session_id}")
 
@@ -361,6 +363,15 @@ class HandlerAvatarMuseTalk(HandlerBase):
             if need_switch:
                 context._current_tts_stream_key = stream_key_str
         if need_switch:
+            # Different TTS stream = new reply. Clear queued frames from the
+            # previous speech so they cannot play after the new answer ends
+            # (user-visible "extra repeated segment").
+            if prev_key and context.processor is not None:
+                logger.info(
+                    f"MuseTalk: TTS stream switch {prev_key} -> {stream_key_str}, "
+                    "clearing previous speech queues"
+                )
+                context.processor.interrupt()
             if context.input_slice_context is not None:
                 discarded = context.input_slice_context.flush()
                 if discarded is not None:
@@ -378,6 +389,8 @@ class HandlerAvatarMuseTalk(HandlerBase):
 
         speech_id = inputs.stream_id.stream_key_str if inputs.stream_id else None
         speech_end = inputs.is_last_data
+        if need_switch:
+            latency.mark("musetalk", "audio_in", session_id=context.session_id, speech_id=speech_id)
         audio_entry = inputs.data.get_main_definition_entry()
         audio_array = inputs.data.get_main_data()
         if context.config.debug:

@@ -11,6 +11,8 @@ class ChatSignalType(str, Enum):
     SESSION_STOP = "session_stop"
     # Semantic turn detection signals
     SEMANTIC_WAIT = "semantic_wait"  # Utterance incomplete, request extended wait
+    # Wake-word detector: session should start listening for a user question
+    WAKE_WORD = "wake_word"
     # Agent system signal
     ENVIRONMENT_EVENT = "environment_event"
 

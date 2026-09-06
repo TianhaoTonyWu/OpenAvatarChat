@@ -280,20 +280,22 @@ class RtcStream(AsyncAudioVideoStreamHandler):
                         )
                     )
                 elif message['header']['name'] == 'SendHumanText':
-                    # self.client_session_delegate.emit_signal(
-                    #     ChatSignal(
-                    #         type=ChatSignalType.INTERRUPT,
-                    #         source_type=ChatSignalSourceType.CLIENT,
-                    #         source_name="rtc",
-                    #     )
-                    # )
+                    # Typed text is an explicit user turn: open conversation
+                    # listening (do not require the wake word) and stop current
+                    # playback so the new question can be answered immediately.
+                    shared = getattr(self.client_session_delegate, "shared_states", None)
+                    if shared is not None:
+                        shared.listening_enabled = True
+                        shared.human_speech_active = False
+                        shared.awaiting_avatar_response = True
+                        shared.duplug_user_speaking = False
+                        shared.duplug_turn_complete = False
                     self.client_session_delegate.emit_signal(
                         ChatSignal(
-                            # begin a new round of responding
-                            type=ChatSignalType.STREAM_BEGIN,
-                            stream_type=ChatDataType.AVATAR_AUDIO,
+                            type=ChatSignalType.INTERRUPT,
                             source_type=ChatSignalSourceType.CLIENT,
                             source_name="rtc",
+                            signal_data={"reason": "typed_text"},
                         )
                     )
                     self.client_session_delegate.put_data(

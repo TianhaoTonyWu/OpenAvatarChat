@@ -1,7 +1,7 @@
 """
 Wake-word gate for conversation VAD.
 
-Standby: only this handler listens (mini Silero VAD + Xiaoyu keyword check).
+Standby: only this handler listens (mini Silero VAD + local FunASR keyword check).
 After a wake word: duplex VAD + Duplug open for full-duplex multi-turn
 conversation. Return to standby after listen_timeout of confirmed idle
 (no user speech, Duplug idle, avatar not speaking, and not waiting for
@@ -42,11 +42,12 @@ from chat_engine.data_models.runtime_data.data_bundle import (
     DataBundleEntry,
 )
 from engine_utils.general_slicer import SliceContext, slice_data
-from handlers.asr.xiaoyu.xiaoyu_asr_client import (
-    DEFAULT_API_KEY,
-    DEFAULT_ASR_URL,
-    XiaoyuLiveSession,
-    recognize as xiaoyu_recognize,
+from engine_utils.latency_tracer import latency
+from handlers.asr.sensevoice.shared_model import (
+    DEFAULT_ASR_MODEL,
+    asr_generate,
+    configure_hotwords,
+    get_asr_model,
 )
 
 
@@ -62,8 +63,8 @@ _HOMOPHONE_MAP = {
 
 class WakeWordConfigModel(HandlerBaseConfigModel, BaseModel):
     keywords: List[str] = Field(default_factory=lambda: ["你好小语"])
-    asr_url: str = Field(default=DEFAULT_ASR_URL)
-    api_key: str = Field(default=DEFAULT_API_KEY)
+    model_name: str = Field(default=DEFAULT_ASR_MODEL)
+    hotwords: List[str] = Field(default_factory=lambda: ["你好小语", "小语"])
     asr_timeout_seconds: float = Field(default=8.0)
     speaking_threshold: float = Field(default=0.25)
     start_delay: int = Field(default=1024)
@@ -94,8 +95,8 @@ class WakeWordContext(HandlerContext):
         self.listen_since: float = 0.0
         self.cooldown_until: float = 0.0
         self.ack_pending_listen: bool = False
-        self.asr_session: Optional[XiaoyuLiveSession] = None
         self.wake_inflight: bool = False
+        self.early_asr_checked: bool = False
 
 
 class HandlerWakeWord(HandlerBase):
@@ -135,12 +136,15 @@ class HandlerWakeWord(HandlerBase):
         )
         if isinstance(handler_config, WakeWordConfigModel):
             self.keywords_norm = _compile_keywords(handler_config.keywords)
-            asr_url = handler_config.asr_url
+            configure_hotwords(handler_config.hotwords or handler_config.keywords)
+            model_name = handler_config.model_name
         else:
-            asr_url = DEFAULT_ASR_URL
+            model_name = DEFAULT_ASR_MODEL
+            configure_hotwords(["你好小语", "小语"])
+        get_asr_model(model_name)
         logger.info(
             f"WakeWord loaded, keywords={[kw for kw, _ in self.keywords_norm]}, "
-            f"asr={asr_url}, vad={model_path}"
+            f"asr={model_name}, vad={model_path}"
         )
 
     def create_context(self, session_context: SessionContext, handler_config=None) -> HandlerContext:
@@ -175,6 +179,8 @@ class HandlerWakeWord(HandlerBase):
             signal_filters=[
                 SignalFilterRule(ChatSignalType.STREAM_END, None, ChatDataType.CLIENT_PLAYBACK),
                 SignalFilterRule(ChatSignalType.STREAM_CANCEL, None, ChatDataType.CLIENT_PLAYBACK),
+                SignalFilterRule(ChatSignalType.STREAM_END, None, ChatDataType.AVATAR_AUDIO),
+                SignalFilterRule(ChatSignalType.STREAM_CANCEL, None, ChatDataType.AVATAR_AUDIO),
             ],
         )
 
@@ -190,13 +196,13 @@ class HandlerWakeWord(HandlerBase):
         avatar_speaking = self._avatar_speaking(context)
         if context.ack_pending_listen:
             self._maybe_finish_ack(context, now)
+            return
         if context.shared_states.listening_enabled:
             self._maybe_timeout_listen(context, now, avatar_speaking)
             return
 
         # Standby only: never barge-in. Conversation interrupt is Duplug's job.
         if avatar_speaking:
-            self._close_live_asr(context)
             self._reset_speech(context)
             return
 
@@ -233,84 +239,48 @@ class HandlerWakeWord(HandlerBase):
                 if not context.in_speech and context.speech_length >= context.config.start_delay:
                     context.in_speech = True
                     logger.info(f"WakeWord: speech start (prob={speech_prob:.2f})")
-                    self._start_live_asr(context)
-                elif context.in_speech:
-                    self._feed_live_asr(context, clip)
+                    latency.begin_turn(context.session_id, "wake")
+                    latency.mark("wakeword", "speech_start", session_id=context.session_id,
+                                 prob=round(float(speech_prob), 2))
             else:
                 context.silence_length += context.clip_size
                 if not context.in_speech:
                     context.speech_length = 0
                     context.speech_buffer.clear()
-                    self._close_live_asr(context)
                 elif self._try_early_wake(context, output_definitions):
                     return
                 elif context.silence_length >= context.config.end_delay:
                     self._on_idle_utterance(context, output_definitions)
-
-    def _start_live_asr(self, context: WakeWordContext):
-        self._close_live_asr(context)
-        try:
-            context.asr_session = XiaoyuLiveSession(
-                asr_url=context.config.asr_url,
-                api_key=context.config.api_key,
-                continuous_decoding=True,
-            )
-            for clip in context.speech_buffer:
-                context.asr_session.feed(clip)
-            logger.info(f"WakeWord: live ASR started ({context.speech_length} samples)")
-        except Exception as exc:
-            logger.warning(f"WakeWord: live ASR start failed: {exc}")
-            context.asr_session = None
-
-    def _feed_live_asr(self, context: WakeWordContext, clip: np.ndarray):
-        if context.asr_session is None:
-            return
-        try:
-            context.asr_session.feed(clip)
-        except Exception as exc:
-            logger.warning(f"WakeWord: live ASR feed failed: {exc}")
-
-    def _close_live_asr(self, context: WakeWordContext):
-        session = context.asr_session
-        context.asr_session = None
-        if session is None:
-            return
-        try:
-            session.close()
-        except Exception:
-            pass
-
-    def _asr_snapshot(self, context: WakeWordContext) -> str:
-        session = context.asr_session
-        if session is None:
-            return ""
-        return (session.final_text or session.partial_text or "").strip()
 
     def _try_early_wake(
         self,
         context: WakeWordContext,
         output_definitions: Dict[ChatDataType, HandlerDataInfo],
     ) -> bool:
-        """Wake as soon as ASR already saw a pure keyword + short trailing silence."""
+        """Wake after a short trailing silence once local ASR sees the keyword."""
         if context.silence_length < context.config.early_wake_silence:
             return False
         if context.speech_length < context.config.min_speech_samples:
             return False
-        text = self._asr_snapshot(context)
+        if context.early_asr_checked:
+            return False
+        context.early_asr_checked = True
+        audio = np.concatenate(context.speech_buffer, axis=0)
+        text = self._asr_text(context, audio)
         if not text:
             return False
         keyword, remainder = _match_keyword(text, self.keywords_norm)
         if keyword is None:
             return False
-        # If the user kept talking after the wake word, wait for full end so
-        # the trailing question is not truncated.
-        if len(remainder) >= context.config.min_query_chars:
-            return False
         logger.info(
             f"WakeWord: early match '{keyword}' from '{text}' "
             f"(silence={context.silence_length})"
         )
-        self._close_live_asr(context)
+        latency.mark(
+            "wakeword", "matched", session_id=context.session_id,
+            keyword=keyword, early=True, text=text,
+            silence_ms=round(context.silence_length / 16.0, 1),
+        )
         self._reset_speech(context)
         self._wake(context, remainder, output_definitions)
         return True
@@ -344,38 +314,23 @@ class HandlerWakeWord(HandlerBase):
                            output_definitions: Dict[ChatDataType, HandlerDataInfo]):
         clips = list(context.speech_buffer)
         speech_len = context.speech_length
-        live = context.asr_session
-        context.asr_session = None
         self._reset_speech(context)
         if speech_len < context.config.min_speech_samples or not clips:
             logger.info(f"WakeWord: drop short speech ({speech_len} samples)")
-            if live is not None:
-                try:
-                    live.close()
-                except Exception:
-                    pass
             return
         text = ""
         try:
-            if live is not None:
-                text = live.finish(timeout=context.config.asr_timeout_seconds)
-            else:
-                audio = np.concatenate(clips, axis=0)
-                text = self._asr_text(context, audio)
+            t_asr = time.perf_counter()
+            audio = np.concatenate(clips, axis=0)
+            text = self._asr_text(context, audio)
+            latency.mark(
+                "wakeword", "asr_finish", session_id=context.session_id,
+                ms=round((time.perf_counter() - t_asr) * 1000.0, 1),
+                text=text,
+            )
         except Exception as exc:
             logger.warning(f"WakeWord ASR failed: {exc}")
-            if live is not None:
-                try:
-                    live.close()
-                except Exception:
-                    pass
             return
-        finally:
-            if live is not None:
-                try:
-                    live.close()
-                except Exception:
-                    pass
         logger.info(f"WakeWord: asr='{text}' samples={speech_len}")
         if not text:
             return
@@ -384,6 +339,10 @@ class HandlerWakeWord(HandlerBase):
             logger.info(f"WakeWord: ignored speech (no keyword): {text}")
             return
         logger.info(f"WakeWord: matched '{keyword}' from '{text}', remainder='{remainder}'")
+        latency.mark(
+            "wakeword", "matched", session_id=context.session_id,
+            keyword=keyword, early=False, text=text, remainder=remainder,
+        )
         self._wake(context, remainder, output_definitions)
 
     def _close_conversation_listen(self, context: WakeWordContext, reason: str):
@@ -403,34 +362,27 @@ class HandlerWakeWord(HandlerBase):
             return
         context.wake_inflight = True
         try:
-            if len(remainder) >= context.config.min_query_chars:
-                self._submit_query_text(context, remainder, output_definitions)
-                self._open_listening(context, "wake with question")
-                context.cooldown_until = time.monotonic() + context.config.cooldown_seconds
-                return
-
-            if not self._submit_ack(context, output_definitions):
-                context.emit_signal(
-                    ChatSignal(
-                        type=ChatSignalType.WAKE_WORD,
-                        source_type=ChatSignalSourceType.HANDLER,
-                        source_name=context.owner,
-                        signal_data={"remainder": remainder},
-                    )
+            remainder = (remainder or "").strip()
+            if remainder:
+                logger.info(
+                    f"WakeWord: drop same-turn remainder '{remainder}', "
+                    "play ack then listen"
                 )
+            self._emit_wake_signal(context, remainder)
+            if not self._submit_ack(context, output_definitions):
                 self._open_listening(context, "ack skipped")
                 return
-
-            context.emit_signal(
-                ChatSignal(
-                    type=ChatSignalType.WAKE_WORD,
-                    source_type=ChatSignalSourceType.HANDLER,
-                    source_name=context.owner,
-                    signal_data={"remainder": remainder},
-                )
-            )
-            self._open_listening(context, "woke, full duplex")
-            logger.info("WakeWord: ack submitted, conversation listening opened")
+            # Keep duplex VAD/Duplug closed until "我在" playback ends.
+            # Opening immediately made leftover speech the first LLM question
+            # and skipped the ack.
+            if context.shared_states is not None:
+                context.shared_states.listening_enabled = False
+                context.shared_states.human_speech_active = False
+                context.shared_states.awaiting_avatar_response = False
+            context.ack_pending_listen = True
+            context.listen_since = time.monotonic()
+            logger.info("WakeWord: ack submitted, hold listening until playback ends")
+            latency.mark("wakeword", "ack_submitted", session_id=context.session_id)
         finally:
             context.wake_inflight = False
             context.cooldown_until = max(
@@ -438,12 +390,23 @@ class HandlerWakeWord(HandlerBase):
                 time.monotonic() + context.config.cooldown_seconds,
             )
 
+    def _emit_wake_signal(self, context: WakeWordContext, remainder: str):
+        context.emit_signal(
+            ChatSignal(
+                type=ChatSignalType.WAKE_WORD,
+                source_type=ChatSignalSourceType.HANDLER,
+                source_name=context.owner,
+                signal_data={"remainder": remainder},
+            )
+        )
+
     def _open_listening(self, context: WakeWordContext, reason: str):
         context.shared_states.listening_enabled = True
         context.shared_states.human_speech_active = False
         context.ack_pending_listen = False
         context.listen_since = time.monotonic()
         logger.info(f"WakeWord: listening opened ({reason})")
+        latency.mark("wakeword", "listening_opened", session_id=context.session_id, reason=reason)
 
     def _maybe_finish_ack(self, context: WakeWordContext, now: float):
         if now - context.listen_since < context.config.ack_timeout_seconds:
@@ -452,22 +415,23 @@ class HandlerWakeWord(HandlerBase):
 
     def on_signal(self, context: HandlerContext, signal: ChatSignal):
         context = cast(WakeWordContext, context)
-        is_playback = (
+        is_ack_playback = (
             signal.related_stream is not None
-            and signal.related_stream.data_type == ChatDataType.CLIENT_PLAYBACK
+            and signal.related_stream.data_type in (
+                ChatDataType.CLIENT_PLAYBACK,
+                ChatDataType.AVATAR_AUDIO,
+            )
         )
-        if not is_playback:
+        if not is_ack_playback:
             return
         if signal.type not in (ChatSignalType.STREAM_END, ChatSignalType.STREAM_CANCEL):
             return
         if not context.ack_pending_listen:
             return
         if signal.type == ChatSignalType.STREAM_CANCEL:
-            context.ack_pending_listen = False
-            context.listen_since = 0.0
-            context.cooldown_until = time.monotonic() + context.config.cooldown_seconds
-            self._close_conversation_listen(context, "ack interrupted")
-            logger.info("WakeWord: ack interrupted, stay idle (questions not accepted)")
+            # Playback of "我在" was stopped (typed question or barge-in).
+            # Open listening so the new turn can proceed.
+            self._open_listening(context, "ack cancelled")
             return
         self._open_listening(context, f"ack playback {signal.type.value}")
 
@@ -509,14 +473,11 @@ class HandlerWakeWord(HandlerBase):
         return True
 
     def _asr_text(self, context: WakeWordContext, audio: np.ndarray) -> str:
-        return xiaoyu_recognize(
-            audio,
-            sample_rate=16000,
-            session_id=context.session_id,
-            asr_url=context.config.asr_url,
-            api_key=context.config.api_key,
-            timeout=context.config.asr_timeout_seconds,
-        )
+        res = asr_generate(audio, batch_size_s=10)
+        if not res or not isinstance(res, list) or not res[0] or "text" not in res[0]:
+            logger.warning(f"WakeWord ASR empty result: {res}")
+            return ""
+        return re.sub(r"<\|.*?\|>", "", str(res[0]["text"] or "")).strip()
 
     def _vad_prob(self, context: WakeWordContext, clip: np.ndarray) -> float:
         clip = clip.squeeze()
@@ -537,6 +498,7 @@ class HandlerWakeWord(HandlerBase):
         context.silence_length = 0
         context.speech_buffer.clear()
         context.model_state = np.zeros((2, 1, 128), dtype=np.float32)
+        context.early_asr_checked = False
 
     def _avatar_speaking(self, context: WakeWordContext) -> bool:
         if context.session_history is None:
@@ -548,7 +510,6 @@ class HandlerWakeWord(HandlerBase):
 
     def destroy_context(self, context: HandlerContext):
         context = cast(WakeWordContext, context)
-        self._close_live_asr(context)
         self._reset_speech(context)
 
 
