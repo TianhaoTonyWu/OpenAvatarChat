@@ -96,9 +96,6 @@ class InterruptHandler(HandlerBase):
             ]
             if len(active_playback) == 1:
                 target_stream = active_playback[0].identity
-            elif len(active_playback) == 0:
-                logger.debug("InterruptHandler: No active playback streams to cancel")
-                return
 
         # Cancel streams via StreamManager
         cancelled = []
@@ -114,6 +111,13 @@ class InterruptHandler(HandlerBase):
                 logger.info(
                     f"InterruptHandler: cancel_streams_by_type cancelled {len(cancelled)} streams"
                 )
+            # Playback chain may miss in-flight LLM/TTS before CLIENT_PLAYBACK opens.
+            extra_keys = {sid.key for sid in cancelled}
+            for dtype in (ChatDataType.AVATAR_AUDIO, ChatDataType.AVATAR_TEXT):
+                for sid in context.stream_manager.cancel_streams_by_type(dtype):
+                    if sid.key not in extra_keys:
+                        extra_keys.add(sid.key)
+                        cancelled.append(sid)
 
         # Record interrupt event in history
         if context.session_history is not None:

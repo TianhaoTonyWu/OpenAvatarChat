@@ -2,8 +2,10 @@
 Duplex VAD Handler - Always-on VAD for Full-Duplex Conversation
 
 This handler extends the standard Silero VAD to support full-duplex mode:
-- Always processes audio (ignores CLIENT_PLAYBACK stream lifecycle signals)
+- Always processes audio after wake (including while the avatar is speaking)
 - Outputs HUMAN_DUPLEX_AUDIO instead of HUMAN_AUDIO
+- Ends a turn on trailing silence (end_delay) or an EOU candidate STREAM_END.
+  Duplug "speak" is not used to cut the turn (it fires too early on short phrases).
 - Listens for SEMANTIC_WAIT signal to extend waiting time
 """
 
@@ -20,6 +22,7 @@ from chat_engine.contexts.session_context import SessionContext
 from chat_engine.data_models.chat_data.chat_data_model import ChatData
 from chat_engine.data_models.runtime_data.data_bundle import DataBundleDefinition, DataBundleEntry
 
+from engine_utils.latency_tracer import latency
 from handlers.vad.silerovad.vad_handler_silero import (
     HandlerAudioVAD, 
     HumanAudioVADContext,
@@ -77,10 +80,11 @@ class DuplexVADHandler(HandlerAudioVAD):
     
     def _create_agc(self):
         from engine_utils.audio_utils import create_mel_agc
+        # Cap max gain so far/quiet noise is not boosted as aggressively as near speech.
         return create_mel_agc(
             target_level_db=-5.0,
-            max_gain_db=30.0,
-            min_gain_db=-30.0,
+            max_gain_db=6.0,
+            min_gain_db=-12.0,
             attack_time_ms=5.0,
             release_time_ms=50.0,
             sample_rate=16000,
@@ -105,7 +109,8 @@ class DuplexVADHandler(HandlerAudioVAD):
                 # Listen for SEMANTIC_WAIT signal to extend waiting time
                 SignalFilterRule(ChatSignalType.SEMANTIC_WAIT, None, None),
                 # Still listen for candidate STREAM_END for EOU collaboration
-                SignalFilterRule(ChatSignalType.STREAM_END, None, ChatDataType.HUMAN_DUPLEX_AUDIO)
+                SignalFilterRule(ChatSignalType.STREAM_END, None, ChatDataType.HUMAN_DUPLEX_AUDIO),
+                SignalFilterRule(ChatSignalType.WAKE_WORD, None, None),
             ]
         )
 
@@ -121,6 +126,17 @@ class DuplexVADHandler(HandlerAudioVAD):
         # This is the key difference from standard VAD
         if inputs.type != ChatDataType.MIC_AUDIO:
             return
+
+        # Only skip when a wake-word handler has closed conversation listening.
+        if context.shared_states is not None and not context.shared_states.listening_enabled:
+            if context.speaking_status != SpeakingStatus.END:
+                logger.info("Duplex VAD: listening closed, drop in-flight utterance")
+                self._reset_for_wake(context)
+            return
+
+        # Full duplex: keep capturing while the avatar is speaking so Duplug
+        # can see semantic nonidle and interrupt. Playback is cancelled only
+        # on Duplug nonidle, not on acoustic VAD start.
 
         # Call parent's processing logic but with modified behavior
         self._handle_audio_input(context, inputs, output_definition.definition)
@@ -162,8 +178,12 @@ class DuplexVADHandler(HandlerAudioVAD):
                 context.peak_volume = db
             head_sample_id = context.slice_context.get_last_slice_start_index()
             speech_prob = self._inference(context, clip)
-            if (context.speaking_status in (SpeakingStatus.END, SpeakingStatus.POST_END)
-                and db < context.config.volume_threshold):
+            # Near-field floor: once a close talker is heard, ignore overlapping
+            # room speech that is much quieter. Also block far-field from starting.
+            energy_floor = context.config.volume_threshold
+            if context.peak_volume > energy_floor:
+                energy_floor = max(energy_floor, context.peak_volume - 18.0)
+            if db < energy_floor:
                 speech_prob = 0.0
             
             if context.peak_volume > -100:
@@ -194,10 +214,14 @@ class DuplexVADHandler(HandlerAudioVAD):
             
             # Check avatar speaking state when entering START state
             if human_speech_start:
+                if context.shared_states is not None:
+                    context.shared_states.human_speech_active = True
+                    context.shared_states.duplug_turn_complete = False
                 # Check if avatar is speaking at the moment we enter START state
                 # Use current time since stream hasn't been created yet
                 import time
                 check_timestamp = time.monotonic()
+                is_avatar_speaking = False
                 if context.session_history:
                     is_avatar_speaking = context.session_history.was_avatar_speaking_at(check_timestamp)
                     context.avatar_was_speaking_at_stream_start = is_avatar_speaking
@@ -209,6 +233,11 @@ class DuplexVADHandler(HandlerAudioVAD):
                     # No session history available, default to False
                     context.avatar_was_speaking_at_stream_start = False
                     logger.warning("Duplex VAD: No session_history available, defaulting avatar_was_speaking_at_stream_start=False")
+                latency.begin_turn(context.session_id, "query")
+                latency.mark(
+                    "vad", "speech_start", session_id=context.session_id,
+                    avatar_speaking=bool(is_avatar_speaking),
+                )
             
             # Handle POST_END entry
             if entering_post_end:
@@ -219,15 +248,23 @@ class DuplexVADHandler(HandlerAudioVAD):
                 context.current_stream_audio.clear()
                 logger.info(f"Duplex VAD entering POST_END, buffered {len(context.previous_stream_audio)} clips")
             
-            # Handle reconnection
+            # Handle reconnection. The current clip is already in
+            # accumulated_speech_audio and will be replayed; skip submitting it
+            # again as a live packet (that would duplicate the last 32ms).
             if reconnect_triggered:
+                if context.shared_states is not None:
+                    context.shared_states.human_speech_active = True
                 self._handle_reconnection_duplex(context, output_definition, sample_rate, speech_id)
+                streamer = context.data_submitter.get_streamer(ChatDataType.HUMAN_DUPLEX_AUDIO)
+                if streamer and streamer.current_stream:
+                    context.current_stream_id = streamer.current_stream.identity
+                continue
             
             if post_end_timeout:
-                logger.info("Duplex VAD POST_END timeout, clearing buffers")
-                # Clear avatar speaking state - VAD cycle is completely ended
+                logger.info("Duplex VAD POST_END timeout, clearing buffers (listening stays open)")
                 context.avatar_was_speaking_at_stream_start = False
-                logger.debug("Duplex VAD: Cleared avatar_was_speaking_at_stream_start state (POST_END timeout)")
+                if context.shared_states is not None:
+                    context.shared_states.human_speech_active = False
             
             # In duplex mode, we don't disable VAD on speech end
             # This is handled by the semantic turn detector instead
@@ -235,11 +272,11 @@ class DuplexVADHandler(HandlerAudioVAD):
             if back_to_end:
                 context.reset()
                 context.reset_model()
-                # Reset semantic wait state
                 context.extend_wait_requested = False
                 context.extended_wait_samples = 0
-                # Clear avatar speaking state - VAD cycle is completely ended
                 context.avatar_was_speaking_at_stream_start = False
+                if context.shared_states is not None:
+                    context.shared_states.human_speech_active = False
                 logger.debug("Duplex VAD: Cleared avatar_was_speaking_at_stream_start state (back_to_end)")
             
             if audio_clip is not None:
@@ -264,6 +301,15 @@ class DuplexVADHandler(HandlerAudioVAD):
                 )
                 if human_speech_end:
                     output_chat_data.is_last_data = True
+                    silence_samples = extra_args.get("silence_length_at_end")
+                    silence_ms = None
+                    if silence_samples is not None:
+                        silence_ms = round(float(silence_samples) / 16.0, 1)
+                    latency.mark(
+                        "vad", "speech_end", session_id=context.session_id,
+                        eou_confirmed=bool(extra_args.get("eou_confirmed")),
+                        silence_ms=silence_ms,
+                    )
                 if timestamp_val >= 0:
                     output_chat_data.timestamp = timestamp_val, sample_rate
                 
@@ -306,6 +352,9 @@ class DuplexVADHandler(HandlerAudioVAD):
         # 使用 accumulated_speech_audio 确保所有音频都被发送，即使多次 reconnection
         total_clips = len(context.accumulated_speech_audio)
         
+        previous_stream_key = None
+        if context.previous_stream_id is not None:
+            previous_stream_key = context.previous_stream_id.stream_key_str
         if context.accumulated_speech_audio:
             logger.info(f"Sending {total_clips} accumulated clips to new duplex stream")
             for clip_index, buffered_clip in enumerate(context.accumulated_speech_audio):
@@ -313,6 +362,8 @@ class DuplexVADHandler(HandlerAudioVAD):
                 output.set_main_data(np.expand_dims(buffered_clip, axis=0))
                 output.add_meta("reconnected_audio", True)
                 output.add_meta("reconnected_audio_index", clip_index)
+                if previous_stream_key:
+                    output.add_meta("continue_from_stream", previous_stream_key)
                 
                 output_chat_data = ChatData(
                     type=ChatDataType.HUMAN_DUPLEX_AUDIO,
@@ -364,11 +415,40 @@ class DuplexVADHandler(HandlerAudioVAD):
         context.extend_wait_requested = False
         context.extended_wait_samples = 0
 
+    def _avatar_speaking(self, context: DuplexVADContext) -> bool:
+        if context.session_history is None:
+            return False
+        try:
+            import time
+            return bool(context.session_history.was_avatar_speaking_at(time.monotonic()))
+        except Exception:
+            return False
+
+    def _close_listening(self, context: DuplexVADContext, reason: str):
+        if context.shared_states is None:
+            return
+        if context.shared_states.listening_enabled or context.shared_states.human_speech_active:
+            logger.info(f"Duplex VAD: conversation listening closed ({reason}), waiting for wake word")
+        context.shared_states.listening_enabled = False
+        context.shared_states.human_speech_active = False
+
+    def _reset_for_wake(self, context: DuplexVADContext):
+        context.reset()
+        context.reset_model()
+        context.reset_reconnect_state()
+        context.extend_wait_requested = False
+        context.extended_wait_samples = 0
+        context.avatar_was_speaking_at_stream_start = False
+        context.speaking_status = SpeakingStatus.END
+
     def on_signal(self, context: HandlerContext, signal: ChatSignal):
         """Handle signals - particularly SEMANTIC_WAIT for extended waiting"""
         context = cast(DuplexVADContext, context)
         
-        if signal.type == ChatSignalType.SEMANTIC_WAIT:
+        if signal.type == ChatSignalType.WAKE_WORD:
+            self._reset_for_wake(context)
+            logger.info("Duplex VAD: reset after wake word")
+        elif signal.type == ChatSignalType.SEMANTIC_WAIT:
             # Request to extend waiting time (utterance not complete)
             context.extend_wait_requested = True
             context.extended_wait_samples = 0

@@ -23,23 +23,24 @@ default:
       RtcClient:
         module: client/rtc_client/client_handler_rtc
         connection_ttl: 900
-        output_video_fps: 24  # Must equal AvatarMusetalk.fps for correct A/V sync
+        output_video_fps: 20  # Must equal AvatarMusetalk.fps for correct A/V sync
 
       # === 打断处理器 - 接收 INTERRUPT 信号并执行流取消 ===
       InterruptHandler:
         module: logic/interrupt/interrupt_handler
 
-      # === 唤醒词：只负责开场。听到关键词后打开对话；长时间无人说话再关掉。打断由 Duplug 负责。===
+      # === 唤醒词：本地 FunASR 听关键词，听到后先说「我在」，播完再打开对话。===
       WakeWord:
         enabled: True
         module: vad/wakeword/wakeword_handler
         keywords:
           - "你好小语"
+        model_name: "iic/speech_paraformer-large-vad-punc_asr_nat-zh-cn-16k-common-vocab8404-pytorch"
+        hotwords:
+          - "你好小语"
           - "小语"
-        asr_url: "ws://speech.xiaoyuzhineng.com:12392/"
-        api_key: "223707f61bf7752c880e"
         asr_timeout_seconds: 8.0
-        speaking_threshold: 0.25
+        speaking_threshold: 0.4
         start_delay: 512  # 32ms：更快进入听写
         end_delay: 4000  # 250ms：尾静音兜底（流式命中可提前到 early_wake_silence）
         early_wake_silence: 1600  # 100ms：纯唤醒词 ASR 已出字即可提前唤醒
@@ -51,33 +52,28 @@ default:
         ack_display_prefix: "【已唤醒】"
         ack_timeout_seconds: 5.0
 
-      # === 双工 VAD：350ms 触发 Duplug 判停，900ms 兜底强制结束 ===
+      # === 双工 VAD：只给 Duplug 提供 speech 门控，真正判停/转写由 Duplug 完成 ===
       SileroVad:
         module: vad/silerovad/duplex_vad_handler
-        speaking_threshold: 0.25
+        speaking_threshold: 0.45  # 近场优先，抑制远处人声
         start_delay: 1024
-        end_delay: 14400  # 900ms 兜底：静音到此仍未判停则强制回答
-        early_end_delay: 5600  # 350ms：静音达到后，若 Duplug 判定说完则开始回答
-        early_end_repeat_delay: 5600
-        buffer_look_back: 2048
-        speech_padding: 512
-        volume_threshold: -45
-        post_end_monitor_samples: 28800  # 1.8s @16kHz，与 SoulXDuplug.post_end_wait_seconds 对齐
-        reconnect_threshold_samples: 28800  # 1.8s：判停后此时间内续说视为同一句
-        post_end_energy_threshold: -5
+        end_delay: 9600  # 600ms：只影响 speech 门控，不再用长尾静音拖慢对话
+        early_end_delay: 9600
+        early_end_repeat_delay: 9600
+        buffer_look_back: 6400  # 400ms 真实起音
+        speech_padding: 512  # 只补在句尾；起音不再垫 0，避免句首「，」
+        volume_threshold: -30  # 近场门限；远处人声通常低于此
+        post_end_monitor_samples: 8000  # 500ms：短停后续说仍并回同一句
+        reconnect_threshold_samples: 8000
+        post_end_speech_trigger_samples: 512  # 1 帧能量即可重连，避免丢掉句尾
+        post_end_energy_threshold: -28
 
-      # === ASR：对话文本由 Duplug 在判停时提交，避免第二路识别污染 LLM ===
+      # === ASR：对话文本由 Duplug cascade（Paraformer）在 speak 时提交 ===
       XiaoyuASR:
         enabled: False
         module: asr/xiaoyu/asr_handler_xiaoyu
-        asr_url: "ws://speech.xiaoyuzhineng.com:12392/"
-        api_key: "223707f61bf7752c880e"
-        timeout_seconds: 15.0
-        sample_rate: 16000
-        input_type_override:
-          HUMAN_AUDIO: HUMAN_DUPLEX_AUDIO
 
-      # === SoulX-Duplug：全双工语义 VAD（打断 + 判停）===
+      # === SoulX-Duplug：官方语义 VAD + 级联 ASR（打断 + 判停 + 转写）===
       # 需先启动 Duplug 推理服务：cd /root/SoulX-Duplug && bash run.sh
       SoulXDuplug:
         enabled: True
@@ -87,13 +83,14 @@ default:
         sample_rate: 16000
         request_timeout: 5.0
         interrupt_on_nonidle: true
-        min_interrupt_chars: 2
-        interrupt_cooldown_seconds: 0.4
-        interrupt_grace_seconds: 0.3
-        asr_url: "ws://speech.xiaoyuzhineng.com:12392/"
-        api_key: "223707f61bf7752c880e"
-        asr_timeout_seconds: 8.0
-        post_end_wait_seconds: 1.8  # 与 SileroVad.post_end_monitor_samples=28800 对齐
+        min_interrupt_chars: 2  # 必须听出至少 2 个有效字才打断，噪音通常没有字
+        interrupt_cooldown_seconds: 0.2
+        interrupt_grace_seconds: 0.2  # nonidle 需持续 0.2s，过滤短噪声
+        min_interrupt_rms: 0.045  # 近场才能打断，远处人声通常到不了
+        min_eou_rms: 0.04  # 整句峰值必须达到近场能量才提交
+        min_feed_rms: 0.03  # 更安静的块当远场，送给 Duplug 静音
+        nearfield_lock_rms: 0.08  # 贴近麦的用户锁定
+        nearfield_lock_seconds: 2.5
 
       # === TTS ===
       CustomTTS:
@@ -103,18 +100,20 @@ default:
         api_key: "maiyuekeji"
         voice_type: "zh_male"
         lang: "zh"
-        sample_rate: 16000
+        sample_rate: 24000
         stream: true
-        min_flush_chars: 4
-
+        emotion: true
+        speedup: true
+        min_flush_chars: 3
+        
       # === LLM ===
       LLMOpenAICompatible:
         enabled: True
         module: llm/openai_compatible/llm_handler_openai_compatible
         model_name: "hermes"
         enable_video_input: False
-        history_length: 20
-        system_prompt: "你是一个语音助手，用一两句简洁的话回答用户的问题。"
+        max_tokens: 64
+        system_prompt: "你是语音助手。用一两句口语直接回答，不要列举、不要开场白、不要重复问题。"
         api_url: "http://127.0.0.1:8080/v1"
         session_id: "open_avatar_chat_session"
         warmup: true
@@ -122,7 +121,7 @@ default:
       # === MuseTalk 数字人 Avatar ===
       AvatarMusetalk:
         module: avatar/musetalk/avatar_handler_musetalk
-        fps: 24
+        fps: 20
         batch_size: 2
         avatar_video_path: "resource/custom5.mp4"
         avatar_model_dir: "models/musetalk/avatar_model"
